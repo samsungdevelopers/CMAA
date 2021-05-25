@@ -1,0 +1,259 @@
+#version 450
+
+precision mediump float;
+precision mediump int;
+
+layout(local_size_x = 128) in;
+
+layout (set = 0, binding = 0) uniform usampler2D partialEdgeTexture;
+restrict layout (set = 0, binding = 1) writeonly uniform uimage2D fullEdgeImage;
+
+layout (set = 0, binding = 2) uniform sampler2D inputSceneTexture;
+restrict layout (set = 0, binding = 3) writeonly uniform image2D outputSceneImage;
+
+restrict layout (set = 0, binding = 4) buffer threadCountBuffer
+{
+	highp uint numCandidates;
+	highp uint numEdges;
+};
+restrict layout (set = 0, binding = 5) readonly buffer candidatePosBuffer
+{
+	highp uint candidatePos[];
+};
+
+restrict layout (set = 0, binding = 6) writeonly buffer edgePosBuffer
+{
+	highp uint edgePos[];
+};
+// how .rgba channels from the edge texture maps to pixel edges:
+//
+//                   A - 0x08
+//              |¯¯¯¯¯¯¯¯¯|
+//              |         |
+//     0x04 - B |  pixel  | R - 0x01
+//              |         |
+//              |_________|
+//                   G - 0x02
+//
+// (A - there's an edge between us and a pixel above us)
+// (R - there's an edge between us and a pixel to the right)
+// (G - there's an edge between us and a pixel at the bottom)
+// (B - there's an edge between us and a pixel to the left)
+
+uvec4 UnpackTexel( uint val )
+{
+    return uvec4( val & 0x3, (val >> 2)& 0x3, (val >> 4)& 0x3, (val >> 6)& 0x3);
+}
+
+void UnpackEdges(highp uvec4 packedEdgesC, highp uvec4 packedEdgesL, highp uvec4 packedEdgesT, out highp uvec4 edgesArray[4][4])
+{
+	// centre edges
+	edgesArray[1][1] = uvec4((packedEdgesC.x & 0x1) != 0, (packedEdgesC.x & 0x2) != 0, (packedEdgesC.x & 0x4) != 0, (packedEdgesC.x & 0x8) != 0);
+	edgesArray[2][1] = uvec4((packedEdgesC.y & 0x1) != 0, (packedEdgesC.y & 0x2) != 0, (packedEdgesC.y & 0x4) != 0, (packedEdgesC.y & 0x8) != 0);
+	edgesArray[1][2] = uvec4((packedEdgesC.z & 0x1) != 0, (packedEdgesC.z & 0x2) != 0, (packedEdgesC.z & 0x4) != 0, (packedEdgesC.z & 0x8) != 0);
+	edgesArray[2][2] = uvec4((packedEdgesC.w & 0x1) != 0, (packedEdgesC.w & 0x2) != 0, (packedEdgesC.w & 0x4) != 0, (packedEdgesC.w & 0x8) != 0);
+	
+	// left edges
+	edgesArray[0][1] = uvec4((packedEdgesL.y & 0x1) != 0, (packedEdgesL.y & 0x2) != 0, (packedEdgesL.x & 0x1) != 0, 						  0);
+	edgesArray[0][2] = uvec4((packedEdgesL.w & 0x1) != 0, (packedEdgesL.w & 0x2) != 0, (packedEdgesL.z & 0x1) != 0, (packedEdgesL.y & 0x2) != 0);
+	
+	// top edges
+	edgesArray[1][0] = uvec4((packedEdgesT.z & 0x1) != 0, (packedEdgesT.z & 0x2) != 0, 							 0, (packedEdgesT.x & 0x2) != 0);
+	edgesArray[2][0] = uvec4((packedEdgesT.w & 0x1) != 0, (packedEdgesT.w & 0x2) != 0, (packedEdgesT.z & 0x1) != 0, (packedEdgesT.y & 0x2) != 0);
+
+}
+
+void main()
+{
+	if (numCandidates <= gl_GlobalInvocationID.x)
+		return;
+	
+	highp uint packedPos = candidatePos[gl_GlobalInvocationID.x];
+	const ivec2 screenPosIBase = ivec2(packedPos >> 16, packedPos & 0xFFFF);
+	
+    uvec4 packedC = UnpackTexel(texelFetch(partialEdgeTexture, screenPosIBase.xy, 0).x);
+	uvec4 packedT = UnpackTexel(texelFetch(partialEdgeTexture, screenPosIBase.xy + ivec2(0, -1), 0).x);
+	uvec4 packedL = UnpackTexel(texelFetch(partialEdgeTexture, screenPosIBase.xy + ivec2(-1, 0), 0).x);		
+	
+	uvec4 pixelsL = uvec4(packedL.y, packedC.x, packedL.w, packedC.z);
+	uvec4 pixelsU = uvec4(packedT.z, packedT.w, packedC.x, packedC.y);
+
+	uvec4 outEdge4 = packedC | ((pixelsL & 0x01) << 2) | ((pixelsU & 0x02) << 2);
+	highp uint outEdge = outEdge4.x | outEdge4.y << 4;
+	imageStore(fullEdgeImage, ivec2(screenPosIBase.x, screenPosIBase.y*2), uvec4(outEdge));
+	
+	outEdge = outEdge4.z | outEdge4.w << 4;
+	imageStore(fullEdgeImage, ivec2(screenPosIBase.x, screenPosIBase.y*2+1), uvec4(outEdge));
+	
+	
+	ivec4 numberOfEdges4 = bitCount( outEdge4 );
+	uint hasCandidate;
+	if (any( greaterThan(numberOfEdges4, ivec4(1)) ))
+	{
+		uvec4 fullEdgesArray[4][4];
+		UnpackEdges(outEdge4, packedL, packedT, fullEdgesArray);
+		for(int i = 0; i < 4; i++ )
+		{
+			int x = i%2+1;
+			int y = i/2+1;
+
+			const ivec2 screenPosI = ivec2(screenPosIBase.x*2 + x-1, screenPosIBase.y*2 + y-1);
+
+			const vec4 edgesFlt   = vec4(fullEdgesArray[x][y]);
+
+			const float fromRight   = edgesFlt.r;
+			const float fromBelow   = edgesFlt.g;
+			const float fromLeft    = edgesFlt.b;
+			const float fromAbove   = edgesFlt.a;
+
+			vec4 xFroms = vec4( fromBelow, fromAbove, fromRight, fromLeft );
+
+			float blurCoeff = 0.0;
+
+			// These are additional blurs that complement the main line-based blurring;
+			// Unlike line-based, these do not necessarily preserve the total amount of screen colour as they will
+			// take neighbouring pixel colours and apply them to the one currently processed.
+
+			switch(numberOfEdges4[i])
+			{
+				// 1.) L-like shape.
+				// For this shape, the total amount of screen colour will be preserved when this is a part 
+				// of a (zigzag) diagonal line as the corners from the other side will do the same and
+				// take some of the current pixel's colour in return.
+				// However, in the case when this is an actual corner, the pixel's colour will be partially
+				// overwritten by it's 2 neighbours.
+				case 2:
+					// with value of 0.15, the pixel will retain approx 77% of its colour and the remaining 23% will 
+					// come from its 2 neighbours (which are likely to be blurred too in the opposite direction)
+					blurCoeff = 0.08;
+
+					// Only do blending if it's L shape - if we're between two parallel edges, don't do anything
+					blurCoeff *= (1 - fromBelow * fromAbove) * (1 - fromRight * fromLeft);
+					
+					if (blurCoeff == 0.0)
+						continue;
+					
+					if (all(equal(ivec2(x, y), ivec2(1)))){
+						uint packedTL = UnpackTexel(texelFetch(partialEdgeTexture, screenPosIBase.xy + ivec2(-1, -1), 0).x).w;
+						fullEdgesArray[0][1].w = uint((packedTL & 0x2) != 0);
+						fullEdgesArray[1][0].z = uint((packedTL & 0x1) != 0);
+					}
+					
+					bool isHorizontalA = all(equal(fullEdgesArray[x][y].zw, uvec2(1))) && all(equal(fullEdgesArray[x-1][y].zy, uvec2(0, 1)));
+					bool isHorizontalB = all(equal(fullEdgesArray[x][y].zy, uvec2(1))) && all(equal(fullEdgesArray[x-1][y].zw, uvec2(0, 1)));
+					bool isHCandidate = isHorizontalA || isHorizontalB;
+					
+					// Check that the left side pixels aren't blocked by their immediate right.
+					// Reason for doing this here is because the loop in the Process stage effectively skips it.
+					if (x == 1 && isHCandidate){
+						if (isHorizontalB)
+							isHCandidate = all(equal(fullEdgesArray[x+1][y].xy, uvec2(0, 1)));
+						else
+							isHCandidate = all(equal(fullEdgesArray[x+1][y].xw, uvec2(0, 1)));
+					}
+
+					bool isVerticalA = all(equal(fullEdgesArray[x][y].wx, uvec2(1))) && all(equal(fullEdgesArray[x][y-1].wz, uvec2(0, 1)));
+					bool isVerticalB = all(equal(fullEdgesArray[x][y].wz, uvec2(1))) && all(equal(fullEdgesArray[x][y-1].wx, uvec2(0, 1)));
+					bool isVCandidate = isVerticalA || isVerticalB;
+
+					bool isCandidate = isHCandidate || isVCandidate;
+										
+					if (isCandidate){						
+						hasCandidate |= uint(y);
+						
+						// TODO: put this back in
+						// what if both are candidates? do additional pruning (still not 100% but gets rid of worst case errors)
+						// if( isHCandidate && isVCandidate ){
+							// uvec4 packedR = UnpackTexel(texelFetch(partialEdgeTexture, screenPosIBase.xy + ivec2(1, 0), 0).x);
+							// uvec4 packedB = UnpackTexel(texelFetch(partialEdgeTexture, screenPosIBase.xy + ivec2(0, 1), 0).x);
+							// fullEdgesArray[3][1].w = uvec4((packedEdgesTL & 0x1) != 0);
+							// fullEdgesArray[3][2].z = uint((packedEdgesTL & 0x2) != 0);
+							// fullEdgesArray[1][3].w = uint((packedEdgesTL & 0x1) != 0);
+							// fullEdgesArray[2][3].z = uint((packedEdgesTL & 0x2) != 0);
+
+							// horizontal = ( isHorizontalA && ( ( packedEdgesL & (0x02 | 0x04)) == 0x02 ) ) || ( isHorizontalB && ( ( packedEdgesL & (0x08 | 0x04)) == 0x08 ) );
+						// }
+
+						uint xState = uint(x);// set x candidate bit
+						xState |= uint(isHCandidate) << 2+(x-1); // set horizontal bit
+						xState |= (isHCandidate ? uint(isHorizontalA) : uint(isVerticalA)) << 4+(x-1); // set inverted bit
+						xState <<= 2 + uint((y-1)*6);
+						hasCandidate |= xState;
+						continue;
+					}
+				break;
+			
+				// 2.) U-like shape (surrounded with edges from 3 sides)				
+				case 3:
+					// with value of 0.13, the pixel will retain approx 72% of its colour and the remaining 28% will 
+					// be picked from its 3 neighbours (which are unlikely to be blurred too but could be)
+					blurCoeff = 0.11;
+				break;
+				
+				// 3.) Completely surrounded with edges from all 4 sides				
+				case 4:
+					// with value of 0.07, the pixel will retain 78% of its colour and the remaining 22% will 
+					// come from its 4 neighbours (which are unlikely to be blurred)
+					blurCoeff = 0.05;
+				break;
+				
+				default:
+					continue;
+				break;
+			}
+			
+			vec4 blurMap = xFroms * blurCoeff;
+
+			vec4 pixelC = texelFetch(inputSceneTexture, screenPosI, 0);
+
+			const float centreWeight = 1.0;
+			const float fromBelowWeight = blurMap.x; // (1 / (1 - blurMap.x)) - 1; // this would be the proper math for blending if we were handling
+			const float fromAboveWeight = blurMap.y; // (1 / (1 - blurMap.y)) - 1; // lines (Zs) and mini kernel smoothing here, but since we're doing
+			const float fromRightWeight = blurMap.z; // (1 / (1 - blurMap.z)) - 1; // lines separately, no need to complicate, just tweak the settings.
+			const float fromLeftWeight  = blurMap.w; // (1 / (1 - blurMap.w)) - 1;
+
+			const float fourWeightSum   = dot( blurMap, vec4(1.0) );
+			const float allWeightSum    = centreWeight + fourWeightSum;
+
+			vec4 colour = vec4(0.0);
+			if( fromLeftWeight > 0.0 )
+			{
+				vec3 pixelL = texelFetch(inputSceneTexture, screenPosI + ivec2(-1,0), 0).rgb;
+				colour.rgb += fromLeftWeight * pixelL;
+			}
+			if( fromAboveWeight > 0.0 )
+			{
+				vec3 pixelT = texelFetch(inputSceneTexture, screenPosI + ivec2(0,-1), 0).rgb;
+				colour.rgb += fromAboveWeight * pixelT;
+			}
+			if( fromRightWeight > 0.0 )
+			{
+				vec3 pixelR = texelFetch(inputSceneTexture, screenPosI + ivec2(1,0), 0).rgb;
+				colour.rgb += fromRightWeight * pixelR;
+			}
+			if( fromBelowWeight > 0.0 )
+			{   
+				vec3 pixelB = texelFetch(inputSceneTexture, screenPosI + ivec2(0,1), 0).rgb;
+				colour.rgb += fromBelowWeight * pixelB;
+			}
+
+			colour /= fourWeightSum + 0.0001;
+			colour.a = 1 - centreWeight / allWeightSum;
+
+			colour.rgb = mix(pixelC.rgb, colour.rgb, colour.a).rgb;
+			
+			imageStore(outputSceneImage, screenPosI.xy, vec4( colour.rgb, pixelC.a ));
+		}
+		
+		uint count = bitCount(hasCandidate & 0x3);
+		if (count != 0){
+			uint index = atomicAdd(numEdges, count);
+			highp ivec2 pixelPos = ivec2(screenPosIBase.x, screenPosIBase.y*2);
+			for (highp uint i = 0, j = 0; i < 2; i++)
+				if ((hasCandidate & (i+1)) != 0){
+					highp uint yBits = 0x3F & (hasCandidate >> (2+i*6));
+					edgePos[index+j++] = uint(pixelPos.x << 16 | ((yBits & 0x3) << 30) | (pixelPos.y+i) | ((yBits & 0x3C) << 10));
+				}
+		}
+	}
+}

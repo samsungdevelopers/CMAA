@@ -1,0 +1,204 @@
+#version 450
+
+#define Shift0 0x0
+#define Shift1 0x4
+
+precision mediump float;
+precision mediump int;
+
+layout(local_size_x = 32) in;
+
+layout (set = 0, binding = 1) uniform usampler2D fullEdgeTexture;
+layout (set = 0, binding = 2) uniform sampler2D inputSceneTexture;
+restrict layout (set = 0, binding = 3) writeonly uniform image2D outputSceneImage;
+
+layout (set = 0, binding = 0) uniform transforms
+{
+	highp vec2 invScreen;
+}ubo;
+
+restrict layout (set = 0, binding = 5) readonly buffer threadCountBuffer
+{
+	highp uint numEdges;
+	highp uint numCandidates;
+};
+restrict layout (set = 0, binding = 6) readonly buffer edgePosBuffer
+{
+	highp uint edgePos[];
+};
+
+// Must be even number; Will work with ~16 pretty good too for additional performance, or with ~64 for highest quality.
+const uint c_maxLineLength   = 16;
+
+uvec4 UnpackEdge( uint value )
+{
+   uvec4 ret;
+   ret.x = uint((value & 0x01) != 0);
+   ret.y = uint((value & 0x02) != 0);
+   ret.z = uint((value & 0x04) != 0);
+   ret.w = uint((value & 0x08) != 0);
+   return ret;
+}
+
+void FindLineLength( out highp int lineLengthLeft, out highp int lineLengthRight, ivec2 screenPos, uint rowOffset, bool horizontal, bool invertedZShape, const ivec2 stepRight )
+{
+
+   /////////////////////////////////////////////////////////////////////////////////////////////////////////
+   // TODO: there must be a cleaner and faster way to get to these - a precalculated array indexing maybe?
+   uint maskLeft, bitsContinueLeft, maskRight, bitsContinueRight;
+	  // Horizontal (vertical is the same, just rotated 90º counter-clockwise)
+	  // Inverted Z case:              // Normal Z case:
+	  //   __                          // __
+	  //  X|                           //  X|
+	  // ¯¯                            //   ¯¯
+	  uint maskTraceLeft, maskTraceRight;
+	  uint maskStopLeft, maskStopRight;
+	if( horizontal )
+	{
+		if( invertedZShape )
+		{
+			maskTraceLeft    = 0x02; // tracing bottom edge
+			maskTraceRight   = 0x08; // tracing top edge
+		}
+		else
+		{
+			maskTraceLeft    = 0x08; // tracing top edge
+			maskTraceRight   = 0x02; // tracing bottom edge
+		}
+		maskStopLeft   = 0x04; // stop on left edge
+		maskStopRight  = 0x01; // stop on right edge
+	}
+	else
+	{
+		if( invertedZShape )
+		{
+			maskTraceLeft    = 0x01; // tracing right edge
+			maskTraceRight   = 0x04; // tracing left edge
+		}
+		else
+		{
+			maskTraceLeft    = 0x04; // tracing left edge
+			maskTraceRight   = 0x01; // tracing right edge
+		}
+			maskStopLeft   = 0x02; // stop on bottom edge
+			maskStopRight  = 0x08; // stop on top edge
+	}
+
+		maskLeft         = maskTraceLeft | maskStopLeft;
+		bitsContinueLeft = maskTraceLeft;
+		maskRight        = maskTraceRight | maskStopRight;
+		bitsContinueRight= maskTraceRight;	
+	/////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+	int i = 1;
+	
+	if (horizontal){
+		/*if (rowOffset == 0){
+			uint edgeCentre = texelFetch(fullEdgeTexture, screenPos, 0).r >> 4;
+			if ((edgeCentre & maskRight) != bitsContinueRight)
+			{
+				lineLengthLeft = 0;
+				lineLengthRight = 0;
+				return;
+			}
+		}*/
+		for( ; i < c_maxLineLength/2; i++ )
+		{
+			uint edgeLeft  = texelFetch(fullEdgeTexture, screenPos - stepRight * ivec2(i), 0).r;
+			uint edgeRight = texelFetch(fullEdgeTexture, screenPos + stepRight * ivec2(i), 0).r;
+		  
+			bool stopLeft  = ((edgeLeft >> Shift1) & maskLeft) != bitsContinueLeft;
+			bool stopRight = ((edgeRight >> Shift0) & maskRight) != bitsContinueRight;
+
+			if( stopLeft || stopRight )
+			{
+				lineLengthLeft = (i-1)*2 + int(rowOffset);
+				lineLengthRight = (i-1)*2+1 - int(rowOffset);
+				return;
+			}
+			
+			stopLeft  = ((edgeLeft >> Shift0) & maskLeft) != bitsContinueLeft;
+			stopRight = ((edgeRight >> Shift1) & maskRight) != bitsContinueRight;
+
+			if( stopLeft || stopRight )
+			{
+				lineLengthLeft = i*2-1 + int(rowOffset);
+				lineLengthRight = i*2 - int(rowOffset);
+				return;
+			}
+	   }
+		lineLengthLeft = (i-1)*2 + int(rowOffset);
+		lineLengthRight = (i-1)*2+1 - int(rowOffset);
+	} else {
+		uint shift = rowOffset == 0 ? Shift0 : Shift1;
+		for( ; i < c_maxLineLength; i++ )
+		{
+			uint edgeLeft  = texelFetch(fullEdgeTexture, screenPos - stepRight * ivec2(i), 	0).r;
+			uint edgeRight = texelFetch(fullEdgeTexture, screenPos + stepRight * ivec2(i), 	0).r;
+		  
+			bool stopLeft  = ((edgeLeft >> shift) & maskLeft) != bitsContinueLeft;
+			bool stopRight = ((edgeRight >> shift) & maskRight) != bitsContinueRight;
+
+			if( stopLeft || stopRight )
+			{
+				lineLengthLeft = i-1;
+				lineLengthRight = i-1;
+				return;
+			}
+	    }
+	    lineLengthLeft = lineLengthRight = i;
+	}
+}
+
+void ProcessDetectedZ( in ivec2 screenPos, uint rowOffset, bool horizontal, bool invertedZShape )
+{
+    int lineLengthLeft, lineLengthRight;
+
+    const ivec2 stepRight     = (horizontal)?( ivec2( 1, 0 ) ):( ivec2( 0,  -1 ) );
+    const highp vec2 blendDir    = (horizontal)?( vec2( 0, -1 ) ):( vec2( -1,  0 ) );
+
+    FindLineLength( lineLengthLeft, lineLengthRight, screenPos, rowOffset, horizontal, invertedZShape, stepRight );
+	//if (lineLengthLeft == 0)
+		//return;
+
+    highp float leftOdd  = 0.15 * (lineLengthLeft % 2);
+    highp float rightOdd = 0.15 * (lineLengthRight % 2);
+
+    int loopFrom = -int(lineLengthLeft);
+    int loopTo   = int(lineLengthRight);
+
+    highp float totalLength = float(loopTo - loopFrom)+1 - leftOdd - rightOdd;
+	screenPos.x = screenPos.x * 2 + int(rowOffset);
+    for( int i = loopFrom; i <= loopTo; i++ )
+    {
+       highp ivec2 pixelPos = screenPos + stepRight * i;
+       highp vec2 pixelPosFlt = vec2( pixelPos.x, pixelPos.y) + vec2(0.5);
+ 
+       highp float m = (i + 0.5 - leftOdd - loopFrom) / totalLength;
+       m = clamp( m, 0.0, 1.0 );
+       highp float k = m - float(i >= (horizontal ? 0 : 1));
+       k = (invertedZShape)?(-k):(k);
+
+       vec4 colour = texture(inputSceneTexture, (pixelPosFlt + blendDir * k) * ubo.invScreen);
+      
+       imageStore(outputSceneImage, pixelPos, colour); //, pixelC.a );
+    }
+}
+
+void main()
+{	
+
+	if (numCandidates <= gl_GlobalInvocationID.x)
+		return;
+
+	highp uint packedPos = edgePos[gl_GlobalInvocationID.x];
+	ivec2 screenPosIBase = ivec2((packedPos >> 16) & 0x0FFF, packedPos & 0x0FFF);
+	
+	bvec2 candidates = bvec2(packedPos & 0x40000000, packedPos & 0x80000000);
+	bvec2 horizontal = bvec2(packedPos & 0x1000, packedPos & 0x2000);
+	bvec2 inverted = bvec2(packedPos & 0x4000, packedPos & 0x8000);
+	if (candidates.x)
+		ProcessDetectedZ(screenPosIBase, 0, horizontal.x, inverted.x);
+	if (candidates.y)
+		ProcessDetectedZ(screenPosIBase, 1, horizontal.y, inverted.y);
+}

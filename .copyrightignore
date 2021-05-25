@@ -1,0 +1,15 @@
+.clang-format
+.gitignore
+.snakeignore
+.yml
+.gitmodules
+.jpg
+.png
+.ttf
+doxyfile
+build.gradle.in
+settings.gradle.in
+pull_request_template.md
+glad.h
+glad.c
+khrplatform.h

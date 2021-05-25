@@ -1,0 +1,213 @@
+#version 450
+
+precision mediump float;
+precision mediump int;
+
+layout(local_size_x = 128) in;
+
+layout (set = 0, binding = 0) uniform sampler2D candidateTexture;
+restrict layout (set = 0, binding = 1) writeonly uniform uimage2D partialEdgeImage;
+
+restrict layout (set = 0, binding = 2) buffer threadCountBuffer
+{
+	highp uint numEdges;
+	highp uint numCandidates;
+};
+restrict layout (set = 0, binding = 3) buffer candidatePosBuffer
+{
+	highp uint candidatePos[];
+};
+
+// how .rgba channels from the edge texture maps to pixel edges:
+//
+//                   A - 0x08
+//              |¯¯¯¯¯¯¯¯¯|
+//              |         |
+//     0x04 - B |  pixel  | R - 0x01
+//              |         |
+//              |_________|
+//                   G - 0x02
+//
+// (A - there's an edge between us and a pixel above us)
+// (R - there's an edge between us and a pixel to the right)
+// (G - there's an edge between us and a pixel at the bottom)
+// (B - there's an edge between us and a pixel to the left)
+
+// Expecting values of 1 and 0 only!
+uint PackEdge( uvec2 edges )
+{
+   return uint(dot( edges, uvec2( 1, 2) ));
+}
+
+vec2 UnpackThresholds( uint val )
+{
+    return vec2( val & 0x0F, val >> 4 ) / 15.0f;
+}
+
+uint packedVals[6][6];
+
+uint PruneNonDominantEdges( int offX, int offY, const uint packedVals[6][6] )
+{	
+	vec2 pixelP0P0 = UnpackThresholds( packedVals[offX][offY] );    
+    vec2 pixelP1P0 = UnpackThresholds( packedVals[offX+1][offY] );  
+    vec2 pixelP0P1 = UnpackThresholds( packedVals[offX][offY+1] );  
+    vec2 pixelM1P0 = UnpackThresholds( packedVals[offX-1][offY] );  
+    vec2 pixelP0M1 = UnpackThresholds( packedVals[offX][offY-1] );  
+    vec2 pixelP1M1 = UnpackThresholds( packedVals[offX+1][offY-1] );
+    vec2 pixelM1P1 = UnpackThresholds( packedVals[offX-1][offY+1] );
+    vec2 pixelM1M1 = UnpackThresholds( packedVals[offX-1][offY-1] );
+    vec2 pixelP1P1 = UnpackThresholds( packedVals[offX+1][offY+1] );
+
+	vec3 edges[6];
+	edges[ 0].x = pixelP0M1.y;
+    edges[ 0].y = pixelP1M1.y;
+    edges[ 0].z = pixelM1P0.x;
+    edges[ 1].x = pixelP1P0.y;
+    edges[ 1].y = pixelM1P1.x;
+    edges[ 1].z = pixelP0P1.x;
+
+	edges[ 2].x = pixelM1M1.x;
+    edges[ 2].y = pixelP0M1.x;
+    edges[ 2].z = pixelP1M1.x;
+    edges[ 3].x = pixelP0P0.y;
+    edges[ 3].y = pixelP1P0.x;
+    edges[ 3].z = pixelP1P1.x;
+
+    edges[ 4].x = pixelM1M1.y;
+    edges[ 4].y = pixelM1P0.y;
+    edges[ 4].z = pixelP0P0.x;	
+    edges[ 5].x = pixelM1P1.y;	
+    edges[ 5].y = pixelP0P1.y;
+    edges[ 5].z = pixelP1P1.y;
+
+    vec3 maxE3 = vec3( 0.0, 0.0, 0.0 );
+
+    float avg = 0.0;
+
+	const vec3 inv12 = vec3( 1, 1, 1 ) / 12.0;
+
+    for( int i = 0; i < 2; i++ )
+    {
+        maxE3 = max( maxE3, edges[i] );
+
+        avg += dot( edges[i], inv12);
+    }
+
+	vec3 maxE3XY;	
+	float avgXY = 0.0;
+
+    for( int i = 0; i < 2; i++ )
+    {
+		maxE3XY = max(maxE3, edges[i+2]);//max(max( maxE3.x, maxE3.y ), maxE3.z);
+		
+		avgXY += dot( edges[i+2], inv12);
+	}
+
+	float maxE = max(max( maxE3XY.x, maxE3XY.y ), maxE3XY.z);
+	const float NonDominantEdgeRemovalAmount = 0.15; // TODO: pass in as uniform
+    float threshold = (avg+avgXY) * (1.0 - NonDominantEdgeRemovalAmount) + maxE * (NonDominantEdgeRemovalAmount);
+            
+    uint cx = uint(pixelP0P0.x > threshold);
+	
+	avgXY = 0;
+	for( int i = 0; i < 2; i++ )
+    {
+		maxE3XY = max(maxE3, edges[i+4]);//max(max( maxE3.x, maxE3.y ), maxE3.z);
+		
+		avgXY += dot( edges[i+4], inv12);
+	}
+
+	maxE = max(max( maxE3XY.x, maxE3XY.y ), maxE3XY.z);
+    threshold = (avg+avgXY) * (1.0 - NonDominantEdgeRemovalAmount) + maxE * (NonDominantEdgeRemovalAmount);
+
+    uint cy = uint(pixelP0P0.y > threshold);
+
+    return PackEdge(uvec2(cx, cy));
+}
+
+void getEdges(ivec2 coord, const ivec2 screenPosIBase, bool needSamples[3][3])
+{
+		if (needSamples[coord.x][coord.y]){
+			uvec4 samp = uvec4(texelFetch(candidateTexture, screenPosIBase + coord-1, 0) * 255.5);
+			ivec2 xy2 = coord*2;
+			packedVals[xy2.x][xy2.y] = samp.x;
+			packedVals[xy2.x+1][xy2.y] = samp.y;
+			packedVals[xy2.x][xy2.y+1] = samp.z;
+			packedVals[xy2.x+1][xy2.y+1] = samp.w;
+		}
+}
+
+void main()
+{
+	if (numEdges <= gl_GlobalInvocationID.x)
+		return;
+	
+	highp uint packedPos = candidatePos[gl_GlobalInvocationID.x];
+	const ivec2 screenPosIBase = ivec2(packedPos >> 16, packedPos & 0xFFFF);
+	
+	uvec4 packedC = uvec4(texelFetch(candidateTexture, screenPosIBase, 0) * 255.5);
+	
+	bool needSamples[3][3];
+	if (packedC.x != 0){
+		needSamples[0][0] = true;
+		needSamples[0][1] = true;
+		needSamples[1][0] = true;
+	}
+	if (packedC.y != 0){
+		needSamples[2][0] = true;
+		needSamples[1][0] = true;
+		needSamples[2][1] = true;
+	}
+	if (packedC.z != 0){
+		needSamples[0][2] = true;
+		needSamples[0][1] = true;
+		needSamples[1][2] = true;
+	}
+	if (packedC.w != 0){
+		needSamples[2][2] = true;
+		needSamples[1][2] = true;
+		needSamples[2][1] = true;
+	}
+	
+	// centre pixel (our output)
+    packedVals[2][2] = packedC.x;
+    packedVals[3][2] = packedC.y;
+    packedVals[2][3] = packedC.z;
+    packedVals[3][3] = packedC.w;
+
+	getEdges(ivec2(0, 0), screenPosIBase, needSamples);
+	getEdges(ivec2(1, 0), screenPosIBase, needSamples);
+	getEdges(ivec2(2, 0), screenPosIBase, needSamples);
+	getEdges(ivec2(0, 1), screenPosIBase, needSamples);
+	getEdges(ivec2(2, 1), screenPosIBase, needSamples);
+	getEdges(ivec2(0, 2), screenPosIBase, needSamples);
+	getEdges(ivec2(1, 2), screenPosIBase, needSamples);
+	getEdges(ivec2(2, 2), screenPosIBase, needSamples);
+
+	uint outEdge;
+	if (packedVals[2][2] != 0)
+		outEdge = PruneNonDominantEdges( 2, 2, packedVals );
+	if (packedVals[3][2] != 0)
+		outEdge |= PruneNonDominantEdges( 3, 2, packedVals ) << 2;
+	if (packedVals[2][3] != 0)
+		outEdge |= PruneNonDominantEdges( 2, 3, packedVals ) << 4;
+	if (packedVals[3][3] != 0)
+		outEdge |= PruneNonDominantEdges( 3, 3, packedVals ) << 6;
+
+
+	imageStore(partialEdgeImage, screenPosIBase, uvec4(outEdge));
+	
+	// These handle the cases where no compute thread was generated due to having no right or bottom edges but do still have a top or left edge.
+	bvec2 missingNeighbours;
+	missingNeighbours.x = (all(equal(uvec4(packedVals[4][2], packedVals[5][2], packedVals[4][3], packedVals[5][3]), uvec4(0))) && (outEdge & (0x4 | 0x40)) != 0);
+	missingNeighbours.y = (all(equal(uvec4(packedVals[2][4], packedVals[3][4], packedVals[2][5], packedVals[3][5]), uvec4(0))) && (outEdge & (0x20 | 0x80)) != 0);
+	
+	if (any(missingNeighbours)){		
+		uint index = atomicAdd(numEdges, uint(missingNeighbours.x) + uint(missingNeighbours.y));
+		highp ivec2 pixelPos = screenPosIBase;
+		if (missingNeighbours.x)
+			candidatePos[index++] = uint((pixelPos.x+1) << 16 | pixelPos.y);
+		if (missingNeighbours.y)
+			candidatePos[index] = uint(pixelPos.x << 16 | pixelPos.y+1);
+	}
+}

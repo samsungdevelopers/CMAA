@@ -1,0 +1,22 @@
+#version 450
+
+restrict layout (set = 0, binding = 0) buffer threadCountBuffer
+{
+	highp uint numCandidates;
+	highp uint numEdges;
+};
+
+restrict layout (set = 0, binding = 1) writeonly buffer indirectBuffer
+{
+	highp uint x;
+	highp uint y;
+	highp uint z;
+};
+
+void main()
+{
+	x = (numEdges + 31) / 32;
+	y = 1;
+	z = 1;
+	numCandidates = 0;
+}
