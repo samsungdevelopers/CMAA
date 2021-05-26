@@ -109,7 +109,6 @@ void main()
 	
 	if(any(bvec4(outEdges)))
     {		
-		//gl_FragDepth = 1.0;
 		highp ivec2 screenPosIBase = screenPosI.xy/2;
 		uint index = atomicAdd(numCandidates, 1);
 		candidatePos[index] = uint(screenPosIBase.x << 16 | screenPosIBase.y);
