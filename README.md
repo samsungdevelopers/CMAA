@@ -107,14 +107,3 @@ This project uses assets from [vulkan-samples-assets](https://github.com/Khronos
 ### Trademarks
 
 Vulkan is a registered trademark of the Khronos Group Inc.
-
-## Contributions
-
-Donated to Khronos by Arm, with further contributions by Sascha Willems and Adam Sawicki. See [CONTRIBUTORS](CONTRIBUTORS.md) for the full contributor list.
-
-Also see [CONTRIBUTING](CONTRIBUTING.md) for contribution guidelines.
-
-## Related resources
-
-- [Mali GPU Best Practices](https://developer.arm.com/solutions/graphics/developer-guides/advanced-guides/mali-gpu-best-practices): A document with recommendations for efficient API usage
-- [PerfDoc](https://github.com/ARM-software/perfdoc): A Vulkan layer which aims to validate applications against Mali GPU Best Practices
