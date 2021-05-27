@@ -30,9 +30,7 @@ For all dependencies set the following environment variables.
 - Android NDK r18+ `ANDROID_NDK_ROOT=<WORK_DIR>/android-ndk`
 - Android SDK `ANDROID_HOME=<WORK_DIR>/android-sdk`
 - Gradle 5+ `GRADLE_HOME=<WORK_DIR>/gradle`
-- [CMake Options](#cmake-options)
-- [3D models](#3d-models)
-- [Performance data](#performance-data)
+
 
 ## Build with Gradle
 

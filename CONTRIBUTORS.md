@@ -17,7 +17,7 @@
 -
 -->
 
-# Contributors to the initial release (sorted alphabetically)
+# Contributors to the vulkan-samples (sorted alphabetically)
 
 * Adam Sawicki
 * Alon Or-bach
